@@ -6109,8 +6109,33 @@ bool Unit::HandleDummyAuraProc(Unit *pVictim, uint32 damage, Aura* triggeredByAu
                     return true;
                 }
             }
+            // King of the Jungle
+            if (dummySpell->SpellIconID == 2850)
+            {
+                if (!procSpell)
+                    return false;
+
+                // Enrage (bear) - single rank - the aura for the bear form from the 2 existing kotj auras has a miscValue == 126
+                if (procSpell->Id == 5229 && triggeredByAura->GetMiscValue() == 126)
+                {
+                    // note : the remove part is done in spellAuras/HandlePeriodicEnergize as RemoveAurasDueToSpell
+                    basepoints[0] = triggerAmount;
+                    triggered_spell_id = 51185;
+                    target = this;
+                    break;
+                }
+                // Tiger Fury (cat) - all ranks - the aura for the cat form from the 2 existing kotj auras has a miscValue != 126
+                if (procSpell->SpellFamilyFlags2 & UI64LIT(0x00000800)  && triggeredByAura->GetMiscValue() != 126)
+                {
+                    basepoints[0] = triggerAmount;
+                    triggered_spell_id = 51178;
+                    target = this;
+                    break;
+                }
+                return false;
+            }
             // Eclipse
-            if (dummySpell->SpellIconID == 2856)
+            else if (dummySpell->SpellIconID == 2856)
             {
                 if (!procSpell)
                     return false;
@@ -6811,6 +6836,51 @@ bool Unit::HandleDummyAuraProc(Unit *pVictim, uint32 damage, Aura* triggeredByAu
 
                 triggered_spell_id = 379;
                 break;
+            }
+            // Flametongue Weapon (Passive)
+            if (dummySpell->SpellFamilyFlags & UI64LIT(0x200000))
+            {
+                if(GetTypeId()!=TYPEID_PLAYER)
+                    return false;
+
+                if(!castItem || !castItem->IsEquipped())
+                    return false;
+
+                //  firehit =  dummySpell->EffectBasePoints[0] / ((4*19.25) * 1.3);
+                float fire_onhit = dummySpell->EffectBasePoints[0] / 100.0;
+
+                float add_spellpower = SpellBaseDamageBonusDone(SPELL_SCHOOL_MASK_FIRE) +
+                                       pVictim->SpellBaseDamageBonusTaken(SPELL_SCHOOL_MASK_FIRE);
+
+                // 1.3speed = 5%, 2.6speed = 10%, 4.0 speed = 15%, so, 1.0speed = 3.84%
+                add_spellpower= add_spellpower / 100.0 * 3.84;
+
+                // Enchant on Off-Hand and ready?
+                if ( castItem->GetSlot() == EQUIPMENT_SLOT_OFFHAND && isAttackReady(OFF_ATTACK))
+                {
+                    float BaseWeaponSpeed = GetAttackTime(OFF_ATTACK)/1000.0;
+
+                    // Value1: add the tooltip damage by swingspeed + Value2: add spelldmg by swingspeed
+                    basepoints[0] = int32( (fire_onhit * BaseWeaponSpeed) + (add_spellpower * BaseWeaponSpeed) );
+                    triggered_spell_id = 10444;
+                }
+
+                // Enchant on Main-Hand and ready?
+                else if ( castItem->GetSlot() == EQUIPMENT_SLOT_MAINHAND && isAttackReady(BASE_ATTACK))
+                {
+                    float BaseWeaponSpeed = GetAttackTime(BASE_ATTACK)/1000.0;
+
+                    // Value1: add the tooltip damage by swingspeed +  Value2: add spelldmg by swingspeed
+                    basepoints[0] = int32( (fire_onhit * BaseWeaponSpeed) + (add_spellpower * BaseWeaponSpeed) );
+                    triggered_spell_id = 10444;
+                }
+
+                // If not ready, we should  return, shouldn't we?!
+                else
+                    return false;
+
+                CastCustomSpell(pVictim,triggered_spell_id,&basepoints[0],NULL,NULL,true,castItem,triggeredByAura);
+                return true;
             }
             // Improved Water Shield
             if (dummySpell->SpellIconID == 2287)
@@ -9036,7 +9106,7 @@ uint32 Unit::SpellDamageBonusDone(Unit *pVictim, SpellEntry const *spellProto, u
             // Ice Lance
             if (spellProto->SpellIconID == 186)
             {
-                if (pVictim->isFrozen())
+                if (pVictim->isFrozen() || isIgnoreUnitState(spellProto))
                 {
                     float multiplier = 3.0f;
 
@@ -9418,9 +9488,9 @@ bool Unit::IsSpellCrit(Unit *pVictim, SpellEntry const *spellProto, SpellSchoolM
                         continue;
                     switch((*i)->GetModifier()->m_miscvalue)
                     {
-                        case  849: if (pVictim->isFrozen()) crit_chance+= 17.0f; break; //Shatter Rank 1
-                        case  910: if (pVictim->isFrozen()) crit_chance+= 34.0f; break; //Shatter Rank 2
-                        case  911: if (pVictim->isFrozen()) crit_chance+= 50.0f; break; //Shatter Rank 3
+                        case  849: if (pVictim->isFrozen() || isIgnoreUnitState(spellProto)) crit_chance+= 17.0f; break; //Shatter Rank 1
+                        case  910: if (pVictim->isFrozen() || isIgnoreUnitState(spellProto)) crit_chance+= 34.0f; break; //Shatter Rank 2
+                        case  911: if (pVictim->isFrozen() || isIgnoreUnitState(spellProto)) crit_chance+= 50.0f; break; //Shatter Rank 3
                         case 7917:                          // Glyph of Shadowburn
                             if (pVictim->HasAuraState(AURA_STATE_HEALTHLESS_35_PERCENT))
                                 crit_chance+=(*i)->GetModifier()->m_amount;
@@ -9989,6 +10059,15 @@ bool Unit::IsImmunedToSpellEffect(SpellEntry const* spellInfo, SpellEffectIndex 
             if (spellInfo->Dispel == DISPEL_MAGIC &&                                      // Magic debuff
                 ((*iter)->GetModifier()->m_miscvalue & GetSpellSchoolMask(spellInfo)) &&  // Check school
                 !IsPositiveEffect(spellInfo->Id, index))                                  // Harmful
+                return true;
+
+        AuraList const& immuneMechanicAuraApply = GetAurasByType(SPELL_AURA_MECHANIC_IMMUNITY_MASK);
+        for(AuraList::const_iterator i = immuneMechanicAuraApply.begin(); i != immuneMechanicAuraApply.end(); ++i)
+            if ((spellInfo->EffectMechanic[index] & (*i)->GetMiscValue() ||
+                spellInfo->Mechanic & (*i)->GetMiscValue()) ||
+                ((*i)->GetId() == 46924 &&                                                // Bladestorm Immunity
+                spellInfo->EffectMechanic[index] & IMMUNE_TO_MOVEMENT_IMPAIRMENT_AND_LOSS_CONTROL_MASK ||
+                spellInfo->Mechanic & IMMUNE_TO_MOVEMENT_IMPAIRMENT_AND_LOSS_CONTROL_MASK))
                 return true;
     }
 
@@ -11576,6 +11655,18 @@ int32 Unit::CalculateSpellDamage(Unit const* target, SpellEntry const* spellProt
             (spellProto->Effect[effect_index] != SPELL_EFFECT_APPLY_AURA || spellProto->EffectApplyAuraName[effect_index] != SPELL_AURA_MOD_DECREASE_SPEED))
         value = int32(value*0.25f*exp(getLevel()*(70-spellProto->spellLevel)/1000.0f));
 
+    // Frostbite trigger aura: if Fingers of Frost is active, it has saved a roll:
+    if(spellProto->EffectTriggerSpell[effect_index] == 12494)
+    {
+        sLog.outDebug("CalculateSpellDamage: called for 12494 (Frostbite), chance is: %u", value);
+        if(m_lastAuraProcRoll >=0) //override independent trigger
+        {
+            sLog.outDebug("CalculateSpellDamage: saved roll from FoF is: %f", m_lastAuraProcRoll);
+            return value > m_lastAuraProcRoll ? 100 : 0;
+        }
+        sLog.outDebug("CalculateSpellDamage: no  saved roll for 12494 (Frostbite)");
+    }
+
     return value;
 }
 
@@ -12599,6 +12690,9 @@ void Unit::ProcDamageAndSpellFor( bool isVictim, Unit * pTarget, uint32 procFlag
 
     RemoveSpellList removedSpells;
     ProcTriggeredList procTriggered;
+    // reset saved roll from Fingers of Frost:
+    if(GetTypeId() == TYPEID_PLAYER)
+        m_lastAuraProcRoll = -1.0f;
     // Fill procTriggered list
     for(AuraMap::const_iterator itr = GetAuras().begin(); itr!= GetAuras().end(); ++itr)
     {
@@ -13571,6 +13665,13 @@ bool Unit::IsTriggeredAtSpellProcEvent(Unit *pVictim, Aura* aura, SpellEntry con
         modOwner->ApplySpellMod(spellProto->Id,SPELLMOD_CHANCE_OF_SUCCESS,chance);
         modOwner->ApplySpellMod(spellProto->Id,SPELLMOD_FREQUENCY_OF_SUCCESS,chance);
     }
+    // Fingers of Frost: save roll for re-use in Frostbite trigger
+    if(aura->GetSpellProto()->EffectTriggerSpell[aura->GetEffIndex()] == 44544)
+    {
+        sLog.outDebug("Fingers of Frost: saving roll; triggered by %u", aura->GetId());
+        m_lastAuraProcRoll = rand_chance();
+        return chance > m_lastAuraProcRoll;
+    }
 
     return roll_chance_f(chance);
 }
@@ -13928,6 +14029,32 @@ void Unit::StopAttackFaction(uint32 faction_id)
     getHostileRefManager().deleteReferencesForFaction(faction_id);
 
     CallForAllControlledUnits(StopAttackFactionHelper(faction_id),false,true,true);
+}
+
+bool Unit::isIgnoreUnitState(SpellEntry const *spell)
+{
+    if(!HasAuraType(SPELL_AURA_IGNORE_UNIT_STATE))
+        return false;
+
+    if(spell->SpellFamilyName == SPELLFAMILY_MAGE)
+    {
+        // Ice Lance
+        if(spell->SpellIconID == 186)
+            return true;
+        // Shatter
+        if(spell->Id == 11170 || spell->Id == 12982 || spell->Id == 12983)
+            return true;
+    }
+    Unit::AuraList const& stateAuras = GetAurasByType(SPELL_AURA_IGNORE_UNIT_STATE);
+    for(Unit::AuraList::const_iterator j = stateAuras.begin();j != stateAuras.end(); ++j)
+    {
+        if((*j)->isAffectedOnSpell(spell))
+        {
+            return true;
+            break;
+        }
+    }
+    return false;
 }
 
 void Unit::CleanupDeletedAuras()

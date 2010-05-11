@@ -312,7 +312,7 @@ pAuraHandler AuraHandler[TOTAL_AURAS]=
     &Aura::HandleNULL,                                      //259 corrupt healing over time spell
     &Aura::HandleNoImmediateEffect,                         //260 SPELL_AURA_SCREEN_EFFECT (miscvalue = id in ScreenEffect.dbc) not required any code
     &Aura::HandlePhase,                                     //261 SPELL_AURA_PHASE undetectable invisibility?     implemented in Unit::isVisibleForOrDetect
-    &Aura::HandleNULL,                                      //262 ignore combat/aura state?
+    &Aura::HandleIgnoreUnitState,                           //262 SPELL_AURA_IGNORE_UNIT_STATE Allows some abilities which are avaible only in some cases.... implemented in Unit::isIgnoreUnitState & Spell::CheckCast
     &Aura::HandleAllowOnlyAbility,                          //263 SPELL_AURA_ALLOW_ONLY_ABILITY player can use only abilities set in SpellClassMask
     &Aura::HandleUnused,                                    //264 unused (3.0.8a-3.2.2a)
     &Aura::HandleUnused,                                    //265 unused (3.0.8a-3.2.2a)
@@ -1211,6 +1211,38 @@ bool Aura::_RemoveAura()
     }
 
     return true;
+}
+
+void Aura::SendFakeAuraUpdate(uint32 auraId, bool remove)
+{
+    WorldPacket data(SMSG_AURA_UPDATE);
+    data << m_target->GetPackGUID();
+    data << uint8(64);
+    data << uint32(remove ? 0 : auraId);
+
+    if(remove)
+    {
+        m_target->SendMessageToSet(&data, true);
+        return;
+    }
+
+    uint8 auraFlags = GetAuraFlags();
+    data << uint8(auraFlags);
+    data << uint8(GetAuraLevel());
+    data << uint8(m_procCharges ? m_procCharges : m_stackAmount);
+
+    if(!(auraFlags & AFLAG_NOT_CASTER))
+    {
+        data << uint8(0);                                   // pguid
+    }
+
+    if(auraFlags & AFLAG_DURATION)
+    {
+        data << uint32(GetAuraMaxDuration());
+        data << uint32(GetAuraDuration());
+    }
+
+    m_target->SendMessageToSet(&data, true);
 }
 
 void Aura::SendAuraUpdate(bool remove)
@@ -3059,6 +3091,7 @@ void Aura::HandleAuraModShapeshift(bool apply, bool Real)
     switch(form)
     {
         case FORM_CAT:
+        case FORM_SHADOW_DANCE:
             PowerType = POWER_ENERGY;
             break;
         case FORM_BEAR:
@@ -3125,7 +3158,8 @@ void Aura::HandleAuraModShapeshift(bool apply, bool Real)
         if(m_target->m_ShapeShiftFormSpellId)
             m_target->RemoveAurasDueToSpell(m_target->m_ShapeShiftFormSpellId, this);
 
-        m_target->SetByteValue(UNIT_FIELD_BYTES_2, 3, form);
+        // For Shadow Dance we must apply Stealth form (30) instead of current (13)
+        m_target->SetByteValue(UNIT_FIELD_BYTES_2, 3, (form == FORM_SHADOW_DANCE) ? uint8(FORM_STEALTH) : form);
 
         if(modelid > 0)
             m_target->SetDisplayId(modelid);
@@ -3194,6 +3228,10 @@ void Aura::HandleAuraModShapeshift(bool apply, bool Real)
                         m_target->SetPower(POWER_RAGE, Rage_val);
                     break;
                 }
+                // Shadow Dance - apply Stealth mode stand flag
+                case FORM_SHADOW_DANCE:
+                    m_target->SetStandFlags(UNIT_STAND_FLAGS_CREEP);
+                    break;
                 default:
                     break;
             }
@@ -3233,6 +3271,10 @@ void Aura::HandleAuraModShapeshift(bool apply, bool Real)
             case FORM_MOONKIN:
                 if(Aura* dummy = m_target->GetDummyAura(37324) )
                     m_target->CastSpell(m_target, 37325, true, NULL, dummy);
+                break;
+            // Shadow Dance - remove Stealth mode stand flag
+            case FORM_SHADOW_DANCE:
+                m_target->RemoveStandFlags(UNIT_STAND_FLAGS_CREEP);
                 break;
             default:
                 break;
@@ -4485,6 +4527,19 @@ void Aura::HandleModMechanicImmunity(bool apply, bool /*Real*/)
 
     m_target->ApplySpellImmune(GetId(),IMMUNITY_MECHANIC,misc,apply);
 
+    // Demonic Circle
+    if (GetSpellProto()->SpellFamilyName == SPELLFAMILY_WARLOCK && GetSpellProto()->SpellIconID == 3221)
+    {
+        if (m_target->GetTypeId() != TYPEID_PLAYER)
+            return;
+        if (apply)
+        {
+            GameObject* obj = m_target->GetGameObject(48018);
+            if (obj)
+                if (m_target->IsWithinDist(obj,GetSpellMaxRange(sSpellRangeStore.LookupEntry(GetSpellProto()->rangeIndex))))
+                    ((Player*)m_target)->TeleportTo(obj->GetMapId(),obj->GetPositionX(),obj->GetPositionY(),obj->GetPositionZ(),obj->GetOrientation());
+        }
+    }
     // Bestial Wrath
     if (GetSpellProto()->SpellFamilyName == SPELLFAMILY_HUNTER && GetSpellProto()->SpellIconID == 1680)
     {
@@ -4721,6 +4776,18 @@ void Aura::HandlePeriodicEnergize(bool apply, bool Real)
                 break;
         }
     }
+    if (!apply && !loading)
+    {
+        switch (GetId())
+        {
+            case 5229:                                      // Druid Bear Enrage
+                if (m_target->HasAura(51185))               // King of the Jungle self Enrage bonus with infinity duration
+                    m_target->RemoveAurasDueToSpell(51185);
+                break;
+            default:
+                break;
+        }
+    }
 
     m_isPeriodic = apply;
 }
@@ -4755,6 +4822,21 @@ void Aura::HandleAuraPeriodicDummy(bool apply, bool Real)
                 }
             }
             break;
+        }
+        case SPELLFAMILY_WARLOCK:
+        {
+            switch (spell->Id)
+            {
+                case 48018:
+                    if (apply)
+                        SendFakeAuraUpdate(62388,false);
+                    else
+                    {
+                        m_target->RemoveGameObject(spell->Id,true);
+                        SendFakeAuraUpdate(62388,true);
+                    }
+                break;
+            }
         }
         case SPELLFAMILY_HUNTER:
         {
@@ -7935,6 +8017,20 @@ void Aura::PeriodicDummyTick()
             }
             break;
         }
+        case SPELLFAMILY_WARLOCK:
+            switch (spell->Id)
+            {
+                case 48018:
+                    GameObject* obj = m_target->GetGameObject(spell->Id);
+                    if (!obj) return;
+                    // We must take a range of teleport spell, not summon.
+                    const SpellEntry* goToCircleSpell = sSpellStore.LookupEntry(48020);
+                    if (m_target->IsWithinDist(obj,GetSpellMaxRange(sSpellRangeStore.LookupEntry(goToCircleSpell->rangeIndex))))
+                        SendFakeAuraUpdate(62388,false);
+                    else
+                        SendFakeAuraUpdate(62388,true);
+            }
+            break;
         case SPELLFAMILY_ROGUE:
         {
             switch (spell->Id)
@@ -8253,6 +8349,45 @@ void Aura::HandlePhase(bool apply, bool Real)
     // need triggering visibility update base at phase update of not GM invisible (other GMs anyway see in any phases)
     if(m_target->GetVisibility() != VISIBILITY_OFF)
         m_target->SetVisibility(m_target->GetVisibility());
+}
+
+void Aura::HandleIgnoreUnitState(bool apply, bool Real)
+{
+    if(m_target->GetTypeId() != TYPEID_PLAYER || !Real)
+        return;
+
+    if(Unit* caster = GetCaster())
+    {
+        if (apply)
+        {
+            switch(GetId())
+            {
+                // Fingers of Frost
+                case 44544:
+                    SetAuraCharges(3); // 3 because first is droped on proc
+                    break;
+                // Juggernaut & Warbringer both need special slot and flag
+                // for alowing charge in combat and Warbringer
+                // for alowing charge in different stances, too
+                case 64976:
+                case 57499:
+                    SetAuraSlot(255);
+                    SetAuraFlags(19);
+                    SendAuraUpdate(false);
+                    break;
+            }
+        }
+        else
+        {
+            switch(GetId())
+            {
+                case 64976:
+                case 57499:
+                    SendAuraUpdate(true);
+                    break;
+            }
+        }
+    }
 }
 
 void Aura::UnregisterSingleCastAura()
